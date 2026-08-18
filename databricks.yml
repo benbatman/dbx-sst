@@ -1,0 +1,91 @@
+bundle:
+  name: parakeet-sst-streaming
+  engine: direct
+  databricks_cli_version: ">=1.3.0"
+
+sync:
+  exclude:
+    - "**/__pycache__"
+    - "**/*.pyc"
+    - "app/dist"
+    - "app/node_modules"
+    - "app/server-dist"
+    - "app/client/.next"
+    - "./.env"
+    - "./.env.example"
+
+variables:
+  catalog:
+    description: Existing UC catalog for the registered model
+    default: dev_doe
+  schema:
+    description: UC schema for the registered model
+    default: sst-testing
+  registered_model_name:
+    description: The registered model name (buffered-streaming pyfunc)
+    default: parakeet_unified_en_06b_streaming
+  model_version:
+    description: >-
+      Model version created by the setup job. MUST be set to the actual
+      registered version (read from the register job output) BEFORE deploying
+      the `serving` / `app` target.
+    default: "1"
+  workload_type:
+    description: GPU model serving workload type
+    default: GPU_SMALL
+  endpoint_name:
+    description: Workspace-unique model serving endpoint name
+    default: parakeet-unified-en-06b-streaming
+  app_name:
+    default: parakeet-live-captions
+
+targets:
+  # Deploy this target first, then run the register job to produce a model version.
+  setup:
+    default: true
+    resources:
+      jobs:
+        register_parakeet_streaming:
+          name: parakeet-live-captions-register-streaming-model
+          tasks:
+            - task_key: register_model
+              spark_python_task:
+                
+                python_file: ./model/register_streaming_model.py
+                parameters:
+                  - --registered-model-name
+                  - ${var.catalog}.${var.schema}.${var.registered_model_name}
+              environment_key: default
+          environments:
+            - environment_key: default
+              spec:
+                environment_version: "3" # Controls Python version, 3 adds Python 3.12 Im pretty sure
+                dependencies:
+                  # Don't need torch, nemo or any of those since we're not actually running the model here
+                  # We have pip requirements and provide an input signautre so log_model doesn't 
+                  # run any inference.
+                  - mlflow
+                  - pandas
+
+  serving:
+    resources:
+      model_serving_endpoints:
+        parakeet_streaming:
+          name: ${var.endpoint_name}
+          config:
+            served_entities:
+              - entity_name: ${var.catalog}.${var.schema}.${var.registered_model_name}
+                entity_version: ${var.model_version}
+                workload_type: ${var.workload_type}
+                workload_size: Small
+                scale_to_zero_enabled: true
+      apps:
+        sst_streaming_app:
+          name: ${var.app_name}
+          description: Near-real-time English live captions (Parakeet buffered streaming)
+          source_code_path: ./
+          resources:
+            - name: parakeet-endpoint
+              serving_endpoint:
+                name: ${resources.model_serving_endpoints.parakeet_streaming.name}
+                permission: CAN_QUERY

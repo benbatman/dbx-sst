@@ -1,0 +1,23 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Env
+.env
+.env.*
+
+# Databricks 
+.databricks
+
+# Node
+.next
+server-dist
+app/client/out
+node_modules
