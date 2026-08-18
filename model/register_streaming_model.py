@@ -159,11 +159,10 @@ PIP_REQUIREMENTS = [
 ]
 
 
-def register_model(registered_model_name: str) -> int:
+def register_model(registered_model_name: str, experiment_name: str) -> int:
     mlflow.set_tracking_uri("databricks")
     mlflow.set_registry_uri("databricks-uc")
-    mlflow.set_experiment("/Users/john.batman@afs.com/parakeet-sst-streaming")
-
+    mlflow.set_experiment(experiment_name=experiment_name)
     signature = ModelSignature(
         inputs=Schema([ColSpec(DataType.string, "audio_b64")]),
         outputs=Schema([ColSpec(DataType.string, "text")]),
@@ -193,10 +192,12 @@ def register_model(registered_model_name: str) -> int:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--registered-model-name", required=True)
+    parser.add_argument("--experiment-name", required=True)
     args = parser.parse_args()
-    register_model(args.registered_model_name)
+    register_model(args.registered_model_name, args.experiment_name)
 
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     main()
+

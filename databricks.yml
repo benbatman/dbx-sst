@@ -32,12 +32,15 @@ variables:
     default: "1"
   workload_type:
     description: GPU model serving workload type
-    default: GPU_SMALL
+    default: CPU_MEDIUM
   endpoint_name:
     description: Workspace-unique model serving endpoint name
     default: parakeet-unified-en-06b-streaming
   app_name:
     default: parakeet-live-captions
+  experiment_name:
+    description: MLflow experiment ID
+    default: none
 
 targets:
   # Deploy this target first, then run the register job to produce a model version.
@@ -55,6 +58,8 @@ targets:
                 parameters:
                   - --registered-model-name
                   - ${var.catalog}.${var.schema}.${var.registered_model_name}
+                  - --experiment-name
+                  - ${var.experiment_name}
               environment_key: default
           environments:
             - environment_key: default
@@ -83,7 +88,7 @@ targets:
         sst_streaming_app:
           name: ${var.app_name}
           description: Near-real-time English live captions (Parakeet buffered streaming)
-          source_code_path: ./
+          source_code_path: ./app/
           resources:
             - name: parakeet-endpoint
               serving_endpoint:
