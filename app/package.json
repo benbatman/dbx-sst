@@ -1,0 +1,26 @@
+{
+  "name": "parakeet-live-captions",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Near-real-time English live captioning: Databricks App relay + Parakeet GPU serving endpoint",
+  "type": "module",
+  "scripts": {
+    "build:client": "next build client",
+    "build:server": "tsc -p tsconfig.json",
+    "build": "npm run build:client && npm run build:server",
+    "start": "node server-dist/index.js",
+    "dev:client": "next dev client -p 3000"
+  },
+  "dependencies": {
+    "next": "^14.2.5",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "@types/react": "^18.3.3",
+    "@types/ws": "^8.5.10",
+    "typescript": "^5.5.4"
+  }
+}
