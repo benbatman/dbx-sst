@@ -1,15 +1,16 @@
 import {createServer, IncomingMessage, ServerResponse } from "http";
 import {readFile} from "fs/promises";
-import {existsSync} from "fs";
+import {existsSync, stat} from "fs";
 import { join, normalize, extname } from "path";
 import { WebSocketServer, WebSocket, Server } from "ws";
-import { encode } from "punycode";
 
+const __dirname = import.meta.dirname
 const PORT = Number(
     process.env.DATABRICKS_APP_PORT || process.env.PORT || 8080
 );
 
 const SERVING_ENDPOINT = process.env.SERVING_ENDPOINT ?? "";
+console.assert(SERVING_ENDPOINT !== "", "SERVING_ENDPOINT should not be empty.")
 
 const SAMPLE_RATE = 16_000
 const BYTES_PER_SAMPLE = 2; // 16-bit PCM
@@ -20,9 +21,9 @@ const LEFT_CONTEXT_BYTES = Math.floor(
     LEFT_CONTEXT_SECONDS * SAMPLE_RATE * BYTES_PER_SAMPLE
 );
 
-const CLIENT_DIR = join(__dirname, "..", "out");
-
+const CLIENT_DIR = join(__dirname, "..", "client", "out");
 const HOST = (process.env.DATABRICKS_HOST ?? "").replace(/\/$/, "")
+console.assert(HOST !== "", "Databricks HOST cannot be empty")
 
 let cachedToken: { value: string, expiresAt: number } | null = null;
 
@@ -65,14 +66,122 @@ async function getToken(): Promise<string> {
     return cachedToken.value;
   }
   cachedToken = await fetchM2mToken(clientId, clientSecret);
+  if (!cachedToken) {
+    throw new Error("Auth token was not retrieved")
+  }
   return cachedToken.value;
 }
 
+interface TranscriptState {
+    committedWords: string[];
+    windowWords: string[];
+}
+
+interface WordMatch {
+    previousStart: number;
+    currentStart: number;
+    length: number;
+}
+
+const MIN_ANCHOR_WORDS = 3;
+const MAX_CURRENT_PREFIX_WORDS = 2;
+
+function splitWords(text: string): string[] {
+    return text.trim().split(/\s+/).filter(Boolean);
+}
+
+
+function normalizeWord(word: string): string {
+  return word
+    .toLowerCase()
+    .replace(/^[^\p{L}\p{N}']+|[^\p{L}\p{N}']+$/gu, "");
+}
+
+/**
+ * Find the longest unchanged sequence shared by the previous and current
+ * rolling-window hypotheses.
+ */
+
+function findBestMatch(
+    previousWords: string[],
+    currentWords: string[],
+): WordMatch {
+    const previous = previousWords.map(normalizeWord);
+    const current = currentWords.map(normalizeWord);
+
+    let best: WordMatch = {
+        previousStart: 0,
+        currentStart: 0,
+        length: 0
+    };
+
+   for (let previousStart = 0; previousStart < previous.length; previousStart++) {
+    for (let currentStart = 0; currentStart < current.length; currentStart++) {
+      let length = 0;
+
+      while (
+        previousStart + length < previous.length &&
+        currentStart + length < current.length &&
+        previous[previousStart + length] !== "" &&
+        previous[previousStart + length] === current[currentStart + length]
+      ) {
+        length++;
+      }
+
+      const isBetter =
+        length > best.length ||
+        (length === best.length &&
+          currentStart < best.currentStart) ||
+        (length === best.length &&
+          currentStart === best.currentStart &&
+          previousStart > best.previousStart);
+
+      if (isBetter) {
+        best = { previousStart, currentStart, length };
+      }
+    }
+  }
+
+  return best;
+}
+
+function stitchTranscript(
+    state: TranscriptState,
+    hypothesis: string,
+): string {
+    const currentWords = splitWords(hypothesis);
+
+    if (currentWords.length === 0) {
+        if (state.windowWords.length > 0) {
+            state.committedWords.push(...state.windowWords);
+            state.windowWords = [];
+        }
+        return state.committedWords.join(" ");
+    }
+
+    if(state.windowWords.length > 0) {
+        const match = findBestMatch(state.windowWords, currentWords);
+
+        if (
+            match.length >= MIN_ANCHOR_WORDS && match.currentStart <= MAX_CURRENT_PREFIX_WORDS
+        ) {
+            const wordsLeavingWindow = state.windowWords.slice(
+                0, match.previousStart
+            );
+
+            state.committedWords.push(...wordsLeavingWindow);
+        }
+    }
+
+    state.windowWords = currentWords;
+
+    return [...state.committedWords, ...state.windowWords].join(" ");
+}
 
 function encodeWav(pcm: Buffer, sampleRate = SAMPLE_RATE): Buffer {
     const numChannels = 1;
     const bitsPerSample = 16;
-    const byteRate = (sampleRate * numChannels * bitsPerSample);
+    const byteRate = (sampleRate * numChannels * bitsPerSample) / 8;
     const blockAlign = (numChannels * bitsPerSample) / 8;
     const dataSize = pcm.length;
 
@@ -80,8 +189,8 @@ function encodeWav(pcm: Buffer, sampleRate = SAMPLE_RATE): Buffer {
     header.write("RIFF", 0);
     header.writeUint32LE(36 + dataSize, 4);
     header.write("WAVE", 8);
-    header.write("fmt", 12);
-     header.writeUInt32LE(16, 16); // PCM fmt chunk size
+    header.write("fmt ", 12);
+    header.writeUInt32LE(16, 16); // PCM fmt chunk size
     header.writeUInt16LE(1, 20); // audio format = PCM
     header.writeUInt16LE(numChannels, 22);
     header.writeUInt32LE(sampleRate, 24);
@@ -100,11 +209,11 @@ async function transcribeWindow(wavBase64: string): Promise<string> {
       if (!HOST || !SERVING_ENDPOINT) {
     throw new Error("Missing DATABRICKS_HOST or SERVING_ENDPOINT config");
   }
-    const token = getToken()
+    const token = await getToken()
     const url = `${HOST}/serving-endpoints/${SERVING_ENDPOINT}/invocations`;
     // pyfunc DataFrame contract: dataframe_records with the `audio_b64` column
     const body = JSON.stringify({
-        dataframe_recoreds: [{audio_b64: wavBase64}]
+        dataframe_records: [{audio_b64: wavBase64}]
     });
 
     const resp = await fetch(url, {
@@ -118,12 +227,13 @@ async function transcribeWindow(wavBase64: string): Promise<string> {
 
     if (!resp.ok) {
         const detail = await resp.text().catch(() => "");
-        throw new Error(`Serving endpoint ${resp.status}`);
+        throw new Error(`Serving endpoint ${resp.status}, ${detail}`);
     }
 
     const data: unknown = await resp.json();
+    console.log("Returned data: ", JSON.stringify(data))
 
-    const preds = (data as {preds?: unknown}).preds ?? data;
+    const preds = (data as {predictions?: unknown}).predictions ?? data;
     if (Array.isArray(preds) && preds.length > 0) {
         const first = preds[0];
         if (typeof first === 'string') return first; 
@@ -182,7 +292,7 @@ async function serveStatic(req: IncomingMessage, res: ServerResponse) {
 }
 
 const server = createServer((req, res) => {
-    if ((req.url ?? "").startsWith("/healthz")) {
+    if ((req.url ?? "").startsWith("/health")) {
         res.writeHead(200);
         res.end("ok");
         return;
@@ -195,9 +305,15 @@ const server = createServer((req, res) => {
 const wss = new WebSocketServer({ server, path: "/ws"});
 
 wss.on("connection", (ws: WebSocket) => {
-    // Per-conn rolling left context
+    // Per-conn rolling left context and full transcript
     let leftContext: Buffer = Buffer.alloc(0);
     let busy = false;
+
+    const transcriptState: TranscriptState = {
+        committedWords: [],
+        windowWords: []
+    };
+
 
     ws.on("message", async (raw: Buffer, isBinary: boolean) => {
         if (!isBinary) return; //control/text frames ignored
@@ -218,9 +334,10 @@ wss.on("connection", (ws: WebSocket) => {
 
         try {
             const wav = encodeWav(windowPcm);
-            const text = await transcribeWindow(wav.toString("base64"));
-            if (ws.readyState === ws.OPEN) {
-                ws.send(JSON.stringify({ type: "caption", text}));
+            const windowText = await transcribeWindow(wav.toString("base64"));
+            const fullText = stitchTranscript(transcriptState, windowText);
+            if (ws.readyState === ws.OPEN && fullText) {
+                ws.send(JSON.stringify({ type: "caption", "text": fullText}));
             }
         } catch (err) {
             if (ws.readyState === ws.OPEN) {
@@ -229,6 +346,8 @@ wss.on("connection", (ws: WebSocket) => {
                     message: (err as Error).message,
                 }));
             }
+        } finally {
+            busy = false;
         }
     });
 });

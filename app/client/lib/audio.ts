@@ -49,7 +49,7 @@ export async function startMic(
   });
 
   const ctx = new AudioContext();
-  await ctx.audioWorklet.addModule("/pcm-worklet-processor.js");
+  await ctx.audioWorklet.addModule("/pcm_worklet_processor.js");
   const source = ctx.createMediaStreamSource(media)
   const node = new AudioWorkletNode(ctx, "pcm-capture", {
     numberOfInputs: 1,

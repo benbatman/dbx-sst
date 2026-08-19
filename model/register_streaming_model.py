@@ -21,25 +21,22 @@ import tempfile
 import wave
 from typing import Any
 
-import mlflow  # real dependency
-import pandas as pd  # NOT `import pd`
+import mlflow
+import pandas as pd
 from mlflow.models import ModelSignature
 from mlflow.types import ColSpec, DataType, Schema
 
-# Use a module logger; do NOT call logging.basicConfig() at import time.
 LOGGER = logging.getLogger(__name__)
 
 MODEL_ID = "nvidia/parakeet-unified-en-0.6b"
 SAMPLE_RATE = 16_000
 # Cap the decoded WAV size to protect the GPU worker from oversized payloads.
-# A ~10 s mono 16 kHz 16-bit window is ~320 KB; 10 MB is a generous safety cap.
+# A ~10 s mono 16 kHz 16-bit window is ~320 KB; 10 MB should be good
 MAX_WAV_BYTES = 10 * 1024 * 1024
 
 
 class ParakeetStreamingPyFunc(mlflow.pyfunc.PythonModel):
     def __init__(self, model_id: str = MODEL_ID) -> None:
-        # All instance fields are declared here so the object is well-defined
-        # before load_context runs.
         self.model_id = model_id
         self._asr_model: Any | None = None
         self._torch: Any | None = None
@@ -49,13 +46,18 @@ class ParakeetStreamingPyFunc(mlflow.pyfunc.PythonModel):
         try:
             import nemo.collections.asr as nemo_asr
             import torch
+            from omegaconf import open_dict
 
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            # from_pretrained downloads the NeMo checkpoint on first load. On a
-            # scale-to-zero endpoint this is the source of the cold-start delay.
             self._asr_model = nemo_asr.models.ASRModel.from_pretrained(
                 model_name=self.model_id
             )
+            # NeMo's RNNT transcription dataloader reads validation_ds with
+            # `.get()`, but this checkpoint stores the field as null because it
+            # does not ship a validation dataset. Normalize it for inference.
+            if self._asr_model.cfg.get("validation_ds") is None:
+                with open_dict(self._asr_model.cfg):
+                    self._asr_model.cfg.validation_ds = {}
             self._asr_model.to(device)
             self._asr_model.eval()
             self._torch = torch
@@ -200,4 +202,3 @@ def main() -> None:
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     main()
-

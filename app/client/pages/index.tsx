@@ -72,7 +72,7 @@ export default function Home() {
         padding: "2rem",
       }}
     >
-      <h1>Parakeet Live Captions</h1>
+      <h1>Testing Parakeet Live Captions</h1>
       <div
         style={{
           background: "#fff7d6",
