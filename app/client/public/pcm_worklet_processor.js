@@ -3,11 +3,11 @@ class PCMCaptureProcessor extends AudioWorkletProcessor {
         super();
         this.chunkSize = 4096;
         this.buffer = new Float32Array(this.chunkSize);
-        this.writeIndex = 0;
+        this.writeIndex = 0; // how much of buffer is currently filled
     }
 
     process(inputs) {
-        const input = inputs[0][0];
+        const input = inputs[0][0]; // first input, first channel (mono)
         if (!input) return true;
 
         let read = 0;
@@ -21,7 +21,7 @@ class PCMCaptureProcessor extends AudioWorkletProcessor {
             read += toCopy;
 
             if (this.writeIndex === this.chunkSize) {
-                this.port.postMessage(this.buffer.slice());
+                this.port.postMessage(this.buffer.slice()); // message must own independent copy
                 this.writeIndex = 0;
             }
         }
