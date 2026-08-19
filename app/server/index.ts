@@ -1,8 +1,8 @@
 import {createServer, IncomingMessage, ServerResponse } from "http";
 import {readFile} from "fs/promises";
-import {existsSync, stat} from "fs";
+import {existsSync} from "fs";
 import { join, normalize, extname } from "path";
-import { WebSocketServer, WebSocket, Server } from "ws";
+import { WebSocketServer, WebSocket } from "ws";
 
 const __dirname = import.meta.dirname
 const PORT = Number(

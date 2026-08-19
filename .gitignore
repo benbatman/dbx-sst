@@ -12,6 +12,7 @@ wheels/
 # Env
 .env
 .env.*
+!.env.example
 
 # Databricks 
 .databricks
