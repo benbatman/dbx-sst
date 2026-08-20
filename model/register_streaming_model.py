@@ -3,8 +3,7 @@ buffered-streaming ASR.
 
 The endpoint is STATELESS. "Buffered streaming" (per the model card) means the
 CLIENT sends a rolling audio window (left context + newest chunk) on every step;
-this server transcribes the whole window and returns text. Cross-request state
-(the rolling window) lives in the Databricks App, never here.
+this server transcribes the whole window and returns text.
 
 Input : DataFrame with a single string column `audio_b64` -- base64 of a mono
         16 kHz 16-bit PCM WAV file containing the rolling window.
@@ -42,19 +41,18 @@ class ParakeetStreamingPyFunc(mlflow.pyfunc.PythonModel):
         self._torch: Any | None = None
 
     def load_context(self, context: mlflow.pyfunc.PythonModelContext) -> None:
-        del context
         try:
             import nemo.collections.asr as nemo_asr
             import torch
             from omegaconf import open_dict
 
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            self._asr_model = nemo_asr.models.ASRModel.from_pretrained(
-                model_name=self.model_id
+            nemo_path = context.artifacts["nemo_model"]
+            self._asr_model = nemo_asr.models.ASRModel.restore_from(
+                restore_path=nemo_path, map_location=device
             )
             # NeMo's RNNT transcription dataloader reads validation_ds with
-            # `.get()`, but this checkpoint stores the field as null because it
-            # does not ship a validation dataset. Normalize it for inference.
+            # `.get()`, must store as as empty dict since we are not grabbing it
             if self._asr_model.cfg.get("validation_ds") is None:
                 with open_dict(self._asr_model.cfg):
                     self._asr_model.cfg.validation_ds = {}
@@ -161,7 +159,9 @@ PIP_REQUIREMENTS = [
 ]
 
 
-def register_model(registered_model_name: str, experiment_name: str) -> int:
+def register_model(
+    registered_model_name: str, experiment_name: str, nemo_path: str
+) -> int:
     mlflow.set_tracking_uri("databricks")
     mlflow.set_registry_uri("databricks-uc")
     mlflow.set_experiment(experiment_name=experiment_name)
@@ -175,6 +175,7 @@ def register_model(registered_model_name: str, experiment_name: str) -> int:
         model_info = mlflow.pyfunc.log_model(
             name="parakeet-streaming-model",
             python_model=ParakeetStreamingPyFunc(),
+            artifacts={"nemo_model": nemo_path},
             signature=signature,
             input_example=input_example,
             registered_model_name=registered_model_name,
@@ -195,8 +196,9 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--registered-model-name", required=True)
     parser.add_argument("--experiment-name", required=True)
+    parser.add_argument("--nemo-path", required=True)
     args = parser.parse_args()
-    register_model(args.registered_model_name, args.experiment_name)
+    register_model(args.registered_model_name, args.experiment_name, args.nemo_path)
 
 
 if __name__ == "__main__":

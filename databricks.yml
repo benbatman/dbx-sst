@@ -24,6 +24,9 @@ variables:
   registered_model_name:
     description: The registered model name (buffered-streaming pyfunc)
     default: parakeet_unified_en_06b_streaming
+  nemo_volume_path:
+    description: UC Volume path to the .nemo weights file to log/register
+    default: /Volumes/dev_doe/sst-testing/models/parakeet-unified-en-0.6b.nemo
   model_version:
     description: >-
       Model version created by the setup job. MUST be set to the actual
@@ -60,6 +63,8 @@ targets:
                   - ${var.catalog}.${var.schema}.${var.registered_model_name}
                   - --experiment-name
                   - ${var.experiment_name}
+                  - --nemo-path
+                  - ${var.nemo_volume_path}
               environment_key: default
           environments:
             - environment_key: default
