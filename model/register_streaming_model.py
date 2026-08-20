@@ -27,7 +27,6 @@ from mlflow.types import ColSpec, DataType, Schema
 
 LOGGER = logging.getLogger(__name__)
 
-MODEL_ID = "nvidia/parakeet-unified-en-0.6b"
 SAMPLE_RATE = 16_000
 # Cap the decoded WAV size to protect the GPU worker from oversized payloads.
 # A ~10 s mono 16 kHz 16-bit window is ~320 KB; 10 MB should be good
@@ -35,8 +34,7 @@ MAX_WAV_BYTES = 10 * 1024 * 1024
 
 
 class ParakeetStreamingPyFunc(mlflow.pyfunc.PythonModel):
-    def __init__(self, model_id: str = MODEL_ID) -> None:
-        self.model_id = model_id
+    def __init__(self) -> None:
         self._asr_model: Any | None = None
         self._torch: Any | None = None
 
@@ -59,10 +57,10 @@ class ParakeetStreamingPyFunc(mlflow.pyfunc.PythonModel):
             self._asr_model.to(device)
             self._asr_model.eval()
             self._torch = torch
-            LOGGER.info("Loaded %s on %s", self.model_id, device)
+            LOGGER.info("Loaded %s on %s", nemo_path, device)
         except Exception as exc:  # noqa: BLE001 - surface any load failure clearly
-            LOGGER.exception("Unable to load %s", self.model_id)
-            raise RuntimeError(f"Unable to load {self.model_id}") from exc
+            LOGGER.exception("Unable to load %s", nemo_path)
+            raise RuntimeError(f"Unable to load {nemo_path}") from exc
 
     @staticmethod
     def _decode_to_wav_path(audio_b64: str) -> str:

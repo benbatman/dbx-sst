@@ -11,8 +11,13 @@ sync:
     - "app/node_modules"
     - "app/server-dist"
     - "app/client/.next"
-    - "./.env"
-    - "./.env.example"
+    - "**/.env"
+    - "**/.env.example"
+    - "./README.md"
+    - "./uv.lock"
+    - "./pyproject.toml"
+    - "./scripts/*"
+    - "./.vscode/*"
 
 variables:
   catalog:
