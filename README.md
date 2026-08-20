@@ -38,7 +38,7 @@ This repo implements pseudo-streaming SST on Databricks Model Serving.
     Ensure model version matches what is in `databricks.yml`
 
     ```bash
-    databricks bundle deploy -t serving
+    databricks bundle deploy -t serving --var="nemo_volume_path=<your-UC-nemo-vol-path>"
     ```
 
 ## Local Dev
