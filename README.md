@@ -1,3 +1,10 @@
+# SST via Databricks Model Serving
+
+This repo implements pseudo-streaming SST on Databricks Model Serving. 
+
+**Features:**
+
+- Loads in `.nemo` model artifact from UC to avoid using `from_pretrained`
 
 ## Deploying
 
