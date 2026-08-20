@@ -8,7 +8,8 @@
     "build:client": "next build client",
     "build:server": "tsc -p tsconfig.json",
     "build": "npm run build:client && npm run build:server",
-    "start": "node server-dist/index.js",
+    "prestart": "npm run build",
+    "start": "node --env-file=.env server-dist/index.js",
     "dev:client": "next dev client -p 3000"
   },
   "dependencies": {
