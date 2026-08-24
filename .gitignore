@@ -22,5 +22,3 @@ wheels/
 server-dist
 app/client/out
 node_modules
-
-.worktrees
