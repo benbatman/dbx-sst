@@ -58,10 +58,10 @@ class PCMCaptureProcessor extends AudioWorkletProcessor {
 
         for (let i=0; i < input.length; i++) {
             this.audio[writeIndex] = input[i];
-            writeIndex;
+            writeIndex++;
 
             if (writeIndex === this.capacity) {
-                writeIndx = 0;
+                writeIndex = 0;
             }
         }
 
