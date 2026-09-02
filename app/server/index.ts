@@ -2,7 +2,8 @@ import {createServer, IncomingMessage, ServerResponse } from "http";
 import {readFile} from "fs/promises";
 import {existsSync} from "fs";
 import { join, normalize, extname } from "path";
-import { WebSocketServer, WebSocket } from "ws";
+import { WebSocketServer, WebSocket, type RawData } from "ws";
+import { randomUUID  } from "crypto";
 
 const __dirname = import.meta.dirname
 const PORT = Number(
@@ -14,6 +15,25 @@ console.assert(SERVING_ENDPOINT !== "", "SERVING_ENDPOINT should not be empty.")
 
 const SAMPLE_RATE = 16_000
 const BYTES_PER_SAMPLE = 2; // 16-bit PCM
+const MODEL_CHUNK_SECONDS = 0.56;
+
+const MODEL_CHUNK_BYTES = Math.floor(
+  MODEL_CHUNK_SECONDS *
+    SAMPLE_RATE *
+    BYTES_PER_SAMPLE,
+);
+
+const MAX_PENDING_SECONDS = 120;
+
+const MAX_PENDING_BYTES =
+  MAX_PENDING_SECONDS *
+  SAMPLE_RATE *
+  BYTES_PER_SAMPLE;
+
+const MAX_BATCH_WINDOWS = 4;
+
+const MIN_SOURCE_SAMPLE_RATE = 8_000;
+const MAX_SOURCE_SAMPLE_RATE = 192_000;
 
 // 5.6s left context by default, prepend to each new chunk
 const LEFT_CONTEXT_SECONDS = 5.6;
@@ -204,47 +224,164 @@ function encodeWav(pcm: Buffer, sampleRate = SAMPLE_RATE): Buffer {
 }
 
 // Serving Endpoint Call
+const SERVING_REQUEST_TIMEOUT_MS = 180_000;
+const SERVING_MAX_ATTEMPTS = 3;
 
-async function transcribeWindow(wavBase64: string): Promise<string> {
-      if (!HOST || !SERVING_ENDPOINT) {
-    throw new Error("Missing DATABRICKS_HOST or SERVING_ENDPOINT config");
-  }
-    const token = await getToken()
-    const url = `${HOST}/serving-endpoints/${SERVING_ENDPOINT}/invocations`;
-    // pyfunc DataFrame contract: dataframe_records with the `audio_b64` column
-    const body = JSON.stringify({
-        dataframe_records: [{audio_b64: wavBase64}]
+function delay(ms: number): Promise<void> {
+    return new Promise((resolve) => {
+        setTimeout(resolve, ms)
     });
+}
 
-    const resp = await fetch(url, {
-        method: "POST",
-        headers: {
-            Authorization: `Bearer ${token}`,
-            "Content-Type": "application/json"
-        }, 
-        body
-    });
-
-    if (!resp.ok) {
-        const detail = await resp.text().catch(() => "");
-        throw new Error(`Serving endpoint ${resp.status}, ${detail}`);
+function predToText(
+    prediction: unknown,
+): string {
+    if (typeof prediction === "string") {
+        return prediction;
     }
 
-    const data: unknown = await resp.json();
-    console.log("Returned data: ", JSON.stringify(data))
-
-    const preds = (data as {predictions?: unknown}).predictions ?? data;
-    if (Array.isArray(preds) && preds.length > 0) {
-        const first = preds[0];
-        if (typeof first === 'string') return first; 
-        if (typeof first === 'object' && "text" in first) {
-            return String((first as {text: unknown}).text ?? "")
-        }
+    if (
+        prediction !== null &&
+        typeof prediction === 'object' &&
+        "text" in prediction
+    ) {
+        return String(
+            (prediction as {text: unknown}).text ?? "",
+        );
     }
+
     return "";
 }
 
+async function transcribeWindows(windows: readonly Buffer[],
+    clientRequestId: string,
+): Promise<string[]> {
+      if (!HOST || !SERVING_ENDPOINT) {
+    throw new Error("Missing DATABRICKS_HOST or SERVING_ENDPOINT config");
+  }
+
+  if (windows.length === 0) {
+    return [];    
+}
+
+    const token = await getToken()
+    const url = `${HOST}/serving-endpoints/${SERVING_ENDPOINT}/invocations`;
+    
+    // pyfunc DataFrame contract: dataframe_records with the `audio_b64` column
+    const body = JSON.stringify({
+        client_request_id: clientRequestId,
+        dataframe_split: {
+            columns: ['audio_b64'],
+            data: windows.map((windowPcm) => [
+                encodeWav(windowPcm).toString("base64")
+            ]),
+        },
+    });
+
+    for (
+        let attempt = 1;
+        attempt <= SERVING_MAX_ATTEMPTS;
+        attempt++
+    ) {
+        const controller = new AbortController();
+
+        const timeoutHandle = setTimeout(() => {
+            controller.abort();
+        }, SERVING_REQUEST_TIMEOUT_MS);
+
+        let response: Response;
+
+        try {
+            response = await fetch(url, {
+                method: "POST",
+                headers: {
+                Authorization: `Bearer ${token}`,
+                "Content-Type": "application/json",
+                }, 
+                body, 
+                signal: controller.signal
+            });
+        } catch (error) {
+            clearTimeout(timeoutHandle);
+
+            if (attempt === SERVING_MAX_ATTEMPTS) {
+                throw new Error(
+                `Serving endpoint request failed: ${
+                (error as Error).message
+                }`,
+                );
+            }
+
+            await delay(250 * 2 ** (attempt - 1));
+            continue;
+        }
+
+        clearTimeout(timeoutHandle);
+
+        if (!response.ok) {
+            const detail = await response.text().catch(() => "");
+
+            const retryable = response.status === 429 ||
+                                response.status >= 500;
+
+            if (
+                retryable &&
+                attempt < SERVING_MAX_ATTEMPTS
+            ) {
+                await delay(
+                    250 * 2 ** (attempt - 1),
+                );
+                continue;
+            }
+
+            throw new Error(
+                `Serving endpoint ${response.status}: ` +
+                detail.slice(0, 500),
+            );
+        }
+
+        const data: unknown = await response.json()
+
+        const predictions = 
+        (
+            data as {
+                predictions?: unknown;
+            }
+        ).predictions ?? data 
+
+        if (!Array.isArray(predictions)) {
+            throw new Error(
+                "Serving endpoint returned no predictions array"
+            );
+        }
+
+        if (
+            predictions.length !== windows.length
+        ) {
+            throw new Error(
+                `Serving endpoint returned ` +
+                `${predictions.length} predictions for ` +
+                `${windows.length} windows`,
+            )
+        }
+
+        return predictions.map(
+            predToText,
+        );
+    }
+
+    throw new Error(
+        "Serving endpoint retry loop exhausted"
+    );
+}
+
 // HTTP static server 
+
+const CROSS_ORIGIN_ISOLATION_HEADERS = {
+  "Cross-Origin-Opener-Policy": "same-origin",
+  "Cross-Origin-Embedder-Policy": "require-corp",
+  "Cross-Origin-Resource-Policy": "same-origin",
+} as const; // const assertion, doesn't affect runtime at all
 
 const MIME: Record<string, string> = {
   ".html": "text/html; charset=utf-8",
@@ -282,7 +419,8 @@ async function serveStatic(req: IncomingMessage, res: ServerResponse) {
     try {
         const content = await readFile(target);
         res.writeHead(200, {
-      "Content-Type": MIME[extname(target)] ?? "application/octet-stream",
+            ...CROSS_ORIGIN_ISOLATION_HEADERS,
+            "Content-Type": MIME[extname(target)] ?? "application/octet-stream",
       });
       res.end(content);
     } catch {
@@ -300,57 +438,888 @@ const server = createServer((req, res) => {
     void serveStatic(req, res);
 });
 
-// WebSocket relay 
+class StreamingLinearResampler {
+    private readonly ratio: number;
+    private sourceSamplesSeen = 0;
+    private outputSamplesProduced = 0;
+    private previousSample: number | null = null;
+    private flushed = false;
 
-const wss = new WebSocketServer({ server, path: "/ws"});
-
-wss.on("connection", (ws: WebSocket) => {
-    // Per-conn rolling left context and full transcript
-    let leftContext: Buffer = Buffer.alloc(0);
-    let busy = false;
-
-    const transcriptState: TranscriptState = {
-        committedWords: [],
-        windowWords: []
-    };
-
-
-    ws.on("message", async (raw: Buffer, isBinary: boolean) => {
-        if (!isBinary) return; //control/text frames ignored
-        const chunk = Buffer.from(raw);
-        if (chunk.length === 0) return;
-
-        if (busy) {
-            leftContext = tailBytes(
-                Buffer.concat([leftContext, chunk]),
-                LEFT_CONTEXT_BYTES
+    constructor(
+        private readonly sourceRate: number,
+        private readonly targetRate: number
+    ) {
+        if (
+            !Number.isFinite(sourceRate) ||
+            sourceRate <= 0 ||
+            !Number.isFinite(targetRate) ||
+            targetRate <= 0
+        ) {
+            throw new Error(
+                "Resampler rates must be positive"
             );
+        }
+
+        this.ratio = sourceRate / targetRate;
+    }
+
+    push(input: Float32Array): Float32Array {
+        if (this.flushed) {
+            throw new Error(
+            "Cannot push audio after resampler flush");
+        }
+
+        if (input.length === 0) {
+            return new Float32Array(0);
+        }
+
+        const chunkStart = this.sourceSamplesSeen;
+        const chunkEnd = chunkStart + input.length - 1;
+
+        // The extra slots cover the boundary sample retained from
+        // the previous chunk and rounding differences
+        const maximumOutput = Math.max(
+            4, 
+            Math.ceil(
+                (input.length * this.targetRate) /
+                this.sourceRate,
+            ) + 4,
+        );
+
+        const output = new Float32Array(
+            maximumOutput,
+        );
+
+        let outputLength = 0;
+
+        while (true) {
+            const sourcePosition = 
+            this.outputSamplesProduced * this.ratio;
+
+            const sourceIndex0 = Math.floor(
+                sourcePosition,
+            );
+            const sourceIndex1 = sourceIndex0 + 1;
+
+            // Hold the final source sample until the next input chunk
+            // supplies the sample on the other side of interpolation
+            if (sourceIndex1 > chunkEnd) {
+                break;
+            }
+
+            const sample0 = this.sampleAt(
+                sourceIndex0, 
+                chunkStart, 
+                input
+            );
+
+            const sample1 = this.sampleAt(
+                sourceIndex1, 
+                chunkStart, 
+                input
+            );
+
+            const fraction = sourcePosition - sourceIndex0;
+
+            output[outputLength] = sample0 + (sample1 - sample0) * fraction;
+
+            outputLength++;
+            this.outputSamplesProduced++
+        }
+
+        this.sourceSamplesSeen += input.length;
+        this.previousSample = input[input.length - 1];
+
+        return output.slice(0, outputLength);
+    }
+
+    flush() : Float32Array {
+        if (this.flushed) {
+            return new Float32Array(0);
+        }
+
+        this.flushed = true;
+
+        if (
+            this.previousSample == null ||
+            this.sourceSamplesSeen === 0
+        ) {
+            return new Float32Array(0);
+        }
+
+        const lastSourceIndex = this.sourceSamplesSeen - 1;
+
+        const output: number[] = [];
+
+        while (true) {
+            const sourcePosition = this.outputSamplesProduced * this.ratio;
+
+            if (
+                sourcePosition > lastSourceIndex + Number.EPSILON
+            ) {
+                break;
+            }
+
+            // At flush time, the only remaining interpolation point
+            // is at the final source sample. Clamp to that sample.
+            output.push(this.previousSample);
+            this.outputSamplesProduced++;
+        }
+
+        return Float32Array.from(output)
+    }
+
+    private sampleAt(
+        sourceIndex: number, 
+        chunkStart: number, 
+        input: Float32Array,
+    ): number {
+        if (
+            sourceIndex === chunkStart - 1 &&
+            this.previousSample !== null
+        ) {
+            return this.previousSample;
+        }
+
+        const localIndex = sourceIndex - chunkStart;
+
+        if (
+            localIndex < 0 || localIndex >= input.length
+        ) {
+            throw new Error(
+                "Resampler requested unavailable history"
+            );
+        }
+
+        return input[localIndex];
+    }
+}
+
+function floatToPcm16(
+    samples: Float32Array
+): Buffer {
+    const pcm = Buffer.allocUnsafe(
+        samples.length * BYTES_PER_SAMPLE
+    );
+
+    for (
+        let index = 0;
+        index < samples.length;
+        index++
+    ) {
+        const input = Number.isFinite(samples[index])
+        ? samples[index]
+        : 0;
+
+        const clipped = Math.max(
+            -1, 
+            Math.min(1, input)
+        );
+
+        const value = 
+        clipped < 0
+        ? Math.round(clipped * 0x8000)
+        : Math.round(clipped * 0x7fff);
+
+        pcm.writeInt16LE(value, index * BYTES_PER_SAMPLE);
+    }
+
+    return pcm;
+}
+
+class BufferQueue {
+    private chunks: Buffer[] = [];
+    private headIndex = 0;
+    private headOffset = 0;
+    private totalBytes = 0;
+
+
+    get byteLength(): number {
+        return this.totalBytes;
+    }
+
+    push(chunk: Buffer): void {
+        if (chunk.length === 0) {
             return;
         }
 
-        busy = true;
-        const windowPcm = Buffer.concat([leftContext, chunk]);
-        leftContext = tailBytes(windowPcm, LEFT_CONTEXT_BYTES);
+        this.chunks.push(chunk);
+        this.totalBytes += chunk.length;
+    }
+
+    take(byteCount: number): Buffer {
+        if (
+            !Number.isInteger(byteCount) ||
+            byteCount < 0
+        ) {
+            throw new Error(
+                "BufferQueue byteCount must be non-negative"
+            );
+        }
+
+        const output = Buffer.allocUnsafe(byteCount);
+        let outputOffset = 0;
+
+        while (outputOffset < byteCount) {
+            const chunk = this.chunks[this.headIndex];
+
+            const availableInHead = chunk.length - this.headOffset;
+
+            const copyLength = Math.min(
+                availableInHead,
+                byteCount - outputOffset
+            );
+
+            chunk.copy(
+                output, 
+                outputOffset, 
+                this.headOffset, 
+                this.headOffset + copyLength
+            );
+
+            outputOffset += copyLength;
+            this.headOffset += copyLength;
+
+            if (this.headOffset === chunk.length) {
+                this.headIndex++;
+                this.headOffset = 0;
+            }
+        }
+
+        this.totalBytes -= byteCount;
+        this.compact();
+
+        return output;
+    }
+
+    takeAll(): Buffer {
+        return this.take(this.totalBytes);
+    }
+
+    private compact(): void {
+        if (
+            this.headIndex >= 64 ||
+            this.headIndex * 2 >= this.chunks.length
+        ) {
+            this.chunks.splice(0, this.headIndex);
+            this.headIndex = 0;
+        }
+
+        if (this.totalBytes === 0) {
+            this.chunks = [];
+            this.headIndex = 0;
+            this.headOffset = 0;
+        }
+    }
+}
+
+// binary packet decoder
+
+// Special constants to define and validate custom binary audio packet
+// Sent from browser worker to server
+
+const AUDIO_PACKET_MAGIC = 0x31445541;
+const AUDIO_PACKET_HEADER_BYTES = 12;
+const MAX_SOURCE_FRAME_SAMPLES = 200_000;
+
+interface DecodedAudioPacket {
+    sequence: number;
+    samples: Float32Array;
+}
+
+function decodeAudioPacket(
+    raw: Buffer,
+): DecodedAudioPacket {
+    if (
+        raw.length < AUDIO_PACKET_HEADER_BYTES
+    ) {
+        throw new Error(
+            "Audio packet is shorter than its header"
+        );
+    }
+    const magic = raw.readUInt32LE(0);
+
+    if (magic !== AUDIO_PACKET_MAGIC) {
+        throw new Error(
+            "Audio packet has an invalid magic value"
+        );
+    }
+
+    const sequence = raw.readUInt32LE(4);
+    const sampleCount = raw.readUInt32LE(8);
+
+    if (
+        sampleCount === 0 ||
+        sampleCount > MAX_SOURCE_FRAME_SAMPLES
+    ) {
+        throw new Error(
+            "Invalid audio packet sample count: ${sampleCount}"
+        );
+    }
+
+    const expectedBytes =
+    AUDIO_PACKET_HEADER_BYTES +
+    sampleCount * Float32Array.BYTES_PER_ELEMENT;
+
+    if (raw.length !== expectedBytes) {
+        throw new Error(
+        `Audio packet length mismatch: expected ` +
+        `${expectedBytes}, received ${raw.length}`,
+        );
+    }
+
+    // Decode explicitly as little-endian rather than depending on 
+    // the host machine's type-array byte order
+    const samples = new Float32Array(sampleCount);
+
+    for (
+        let index = 0;
+        index < sampleCount;
+        index++
+    ) {
+        samples[index] = raw.readFloatLE(
+            AUDIO_PACKET_HEADER_BYTES + index * Float32Array.BYTES_PER_ELEMENT
+        );
+    }
+
+    return {
+        sequence, samples,
+    }
+}
+
+interface StartControlMessage {
+  type: "start";
+  version: 1;
+  format: "f32le";
+  sampleRate: number;
+  channels: 1;
+}
+
+interface EndControlMessage {
+  type: "end";
+}
+
+type ControlMessage =
+  | StartControlMessage
+  | EndControlMessage;
+
+interface PendingAudio {
+  id: number;
+  pcm: Buffer;
+}
+
+function rawDataToBuffer(
+  raw: RawData,
+): Buffer {
+  if (Buffer.isBuffer(raw)) {
+    return raw;
+  }
+
+  if (Array.isArray(raw)) {
+    return Buffer.concat(raw);
+  }
+
+  return Buffer.from(raw);
+}
+
+function copyTailBytes(
+  buffer: Buffer,
+  maximumBytes: number,
+): Buffer<ArrayBuffer> {
+  return Buffer.from(
+    tailBytes(buffer, maximumBytes),
+  );
+}
+
+const wss = new WebSocketServer({
+  server,
+  path: "/ws",
+});
+
+wss.on(
+  "connection",
+  (ws: WebSocket) => {
+    const sessionId = randomUUID();
+
+    let started = false;
+    let endRequested = false;
+    let finalSent = false;
+    let failed = false;
+    let socketClosed = false;
+
+    let expectedSequence = 0;
+    let nextPendingId = 0;
+
+    let resampler:
+      | StreamingLinearResampler
+      | null = null;
+
+    const pcmQueue = new BufferQueue();
+
+    // Only successfully inferred audio goes here.
+    let leftContext = Buffer.alloc(0);
+
+    // Only never-yet-committed model chunks go here.
+    const pending: PendingAudio[] = [];
+    let pendingHead = 0;
+    let pendingBytes = 0;
+    let draining = false;
+
+    const transcriptState: TranscriptState = {
+      committedWords: [],
+      windowWords: [],
+    };
+
+    function sendJson(
+      value: object,
+    ): void {
+      if (
+        ws.readyState === WebSocket.OPEN
+      ) {
+        ws.send(JSON.stringify(value));
+      }
+    }
+
+    function failSession(
+      error: unknown,
+    ): void {
+      if (failed) {
+        return;
+      }
+
+      failed = true;
+
+      const message =
+        error instanceof Error
+          ? error.message
+          : "Unknown ASR session error";
+
+      sendJson({
+        type: "error",
+        message,
+      });
+
+      if (
+        ws.readyState === WebSocket.OPEN
+      ) {
+        ws.close(1011, "ASR session failed");
+      }
+    }
+
+    function enqueueModelAudio(
+      pcm: Buffer,
+    ): void {
+      if (pcm.length === 0) {
+        return;
+      }
+
+      if (
+        pcm.length % BYTES_PER_SAMPLE !==
+        0
+      ) {
+        throw new Error(
+          "PCM chunk is not sample-aligned",
+        );
+      }
+
+      if (
+        pendingBytes + pcm.length >
+        MAX_PENDING_BYTES
+      ) {
+        throw new Error(
+          `ASR backlog exceeded ` +
+            `${MAX_PENDING_SECONDS} seconds`,
+        );
+      }
+
+      pending.push({
+        id: nextPendingId,
+        pcm,
+      });
+
+      nextPendingId++;
+      pendingBytes += pcm.length;
+
+      void drainPending();
+    }
+
+    function emitCompleteModelChunks(): void {
+      while (
+        pcmQueue.byteLength >=
+        MODEL_CHUNK_BYTES
+      ) {
+        enqueueModelAudio(
+          pcmQueue.take(MODEL_CHUNK_BYTES),
+        );
+      }
+    }
+
+    function acceptAudioPacket(
+      raw: Buffer,
+    ): void {
+      if (!started || !resampler) {
+        throw new Error(
+          "Audio received before start control message",
+        );
+      }
+
+      if (endRequested) {
+        throw new Error(
+          "Audio received after end control message",
+        );
+      }
+
+      const packet = decodeAudioPacket(raw);
+
+      if (
+        packet.sequence !==
+        expectedSequence
+      ) {
+        throw new Error(
+          `Audio sequence mismatch: expected ` +
+            `${expectedSequence}, received ` +
+            `${packet.sequence}`,
+        );
+      }
+
+      const resampled = resampler.push(
+        packet.samples,
+      );
+
+      const pcm = floatToPcm16(resampled);
+      pcmQueue.push(pcm);
+      emitCompleteModelChunks();
+
+      expectedSequence =
+        (expectedSequence + 1) >>> 0;
+    }
+
+    function handleStart(
+      message: StartControlMessage,
+    ): void {
+      if (started) {
+        throw new Error(
+          "Duplicate start control message",
+        );
+      }
+
+      if (
+        message.version !== 1 ||
+        message.format !== "f32le" ||
+        message.channels !== 1
+      ) {
+        throw new Error(
+          "Unsupported audio stream format",
+        );
+      }
+
+      if (
+        !Number.isInteger(
+          message.sampleRate,
+        ) ||
+        message.sampleRate <
+          MIN_SOURCE_SAMPLE_RATE ||
+        message.sampleRate >
+          MAX_SOURCE_SAMPLE_RATE
+      ) {
+        throw new Error(
+          `Unsupported source sample rate: ` +
+            `${message.sampleRate}`,
+        );
+      }
+
+      resampler =
+        new StreamingLinearResampler(
+          message.sampleRate,
+          SAMPLE_RATE,
+        );
+
+      started = true;
+
+      sendJson({
+        type: "ready",
+      });
+    }
+
+    function handleEnd(): void {
+      if (!started || !resampler) {
+        throw new Error(
+          "End received before start",
+        );
+      }
+
+      if (endRequested) {
+        return;
+      }
+
+      endRequested = true;
+
+      const finalResampled =
+        resampler.flush();
+
+      pcmQueue.push(
+        floatToPcm16(finalResampled),
+      );
+
+      emitCompleteModelChunks();
+
+      if (pcmQueue.byteLength > 0) {
+        enqueueModelAudio(
+          pcmQueue.takeAll(),
+        );
+      }
+
+      void drainPending();
+    }
+
+    function parseControlMessage(
+      raw: Buffer,
+    ): ControlMessage {
+      let value: unknown;
+
+      try {
+        value = JSON.parse(
+          raw.toString("utf8"),
+        );
+      } catch {
+        throw new Error(
+          "Malformed WebSocket control message",
+        );
+      }
+
+      if (
+        value === null ||
+        typeof value !== "object" ||
+        !("type" in value)
+      ) {
+        throw new Error(
+          "Invalid WebSocket control message",
+        );
+      }
+
+      const type = (
+        value as {
+          type: unknown;
+        }
+      ).type;
+
+      if (type === "start") {
+        return value as StartControlMessage;
+      }
+
+      if (type === "end") {
+        return value as EndControlMessage;
+      }
+
+      throw new Error(
+        `Unknown control message: ${String(type)}`,
+      );
+    }
+
+    function finishIfReady(): void {
+      if (
+        !endRequested ||
+        finalSent ||
+        pendingHead < pending.length ||
+        draining ||
+        failed
+      ) {
+        return;
+      }
+
+      const finalText = stitchTranscript(
+        transcriptState,
+        "",
+      );
+
+      finalSent = true;
+
+      sendJson({
+        type: "final",
+        text: finalText,
+      });
+    }
+
+    function compactPending(): void {
+      if (
+        pendingHead >= 64 ||
+        pendingHead * 2 >=
+          pending.length
+      ) {
+        pending.splice(0, pendingHead);
+        pendingHead = 0;
+      }
+
+      if (pendingHead === pending.length) {
+        pending.length = 0;
+        pendingHead = 0;
+      }
+    }
+
+    async function drainPending(): Promise<void> {
+      if (
+        draining ||
+        failed ||
+        socketClosed
+      ) {
+        return;
+      }
+
+      draining = true;
+
+      try {
+        while (
+          pendingHead < pending.length &&
+          !failed &&
+          !socketClosed
+        ) {
+          const batchLength = Math.min(
+            MAX_BATCH_WINDOWS,
+            pending.length - pendingHead,
+          );
+
+          const items = pending.slice(
+            pendingHead,
+            pendingHead + batchLength,
+          );
+
+          const windows: Buffer[] = [];
+
+          // This is candidate context. It is not committed to
+          // leftContext until the whole REST request succeeds.
+          let candidateContext =
+            leftContext;
+
+          for (const item of items) {
+            const windowPcm = Buffer.concat(
+              [
+                candidateContext,
+                item.pcm,
+              ],
+              candidateContext.length +
+                item.pcm.length,
+            );
+
+            windows.push(windowPcm);
+
+            candidateContext =
+              copyTailBytes(
+                windowPcm,
+                LEFT_CONTEXT_BYTES,
+              );
+          }
+
+          const firstId = items[0].id;
+          const lastId =
+            items[items.length - 1].id;
+
+          const requestId =
+            `${sessionId}:` +
+            `${firstId}-${lastId}`;
+
+          const texts =
+            await transcribeWindows(
+              windows,
+              requestId,
+            );
+
+          if (socketClosed || failed) {
+            return;
+          }
+
+          // The request succeeded. Only now do we commit its
+          // acoustic context, transcript state, and queue position.
+          leftContext = candidateContext;
+
+          let latestText = "";
+
+          for (const text of texts) {
+            latestText = stitchTranscript(
+              transcriptState,
+              text,
+            );
+          }
+
+          for (const item of items) {
+            pendingBytes -= item.pcm.length;
+          }
+
+          pendingHead += items.length;
+          compactPending();
+
+          if (latestText) {
+            sendJson({
+              type: "caption",
+              text: latestText,
+            });
+          }
+        }
+      } catch (error) {
+        failSession(error);
+      } finally {
+        draining = false;
+
+        if (
+          !failed &&
+          !socketClosed &&
+          pendingHead < pending.length
+        ) {
+          void drainPending();
+          return;
+        }
+
+        finishIfReady();
+      }
+    }
+
+    ws.on(
+      "message",
+      (
+        raw: RawData,
+        isBinary: boolean,
+      ) => {
+        if (failed || socketClosed) {
+          return;
+        }
 
         try {
-            const wav = encodeWav(windowPcm);
-            const windowText = await transcribeWindow(wav.toString("base64"));
-            const fullText = stitchTranscript(transcriptState, windowText);
-            if (ws.readyState === ws.OPEN && fullText) {
-                ws.send(JSON.stringify({ type: "caption", "text": fullText}));
-            }
-        } catch (err) {
-            if (ws.readyState === ws.OPEN) {
-                ws.send(JSON.stringify({
-                    type: "error",
-                    message: (err as Error).message,
-                }));
-            }
-        } finally {
-            busy = false;
+          const buffer =
+            rawDataToBuffer(raw);
+
+          if (isBinary) {
+            acceptAudioPacket(buffer);
+            return;
+          }
+
+          const message =
+            parseControlMessage(buffer);
+
+          if (message.type === "start") {
+            handleStart(message);
+          } else {
+            handleEnd();
+          }
+        } catch (error) {
+          failSession(error);
         }
+      },
+    );
+
+    ws.on("close", () => {
+      socketClosed = true;
+      failed = true;
+
+      pending.length = 0;
+      pendingHead = 0;
+      pendingBytes = 0;
     });
-});
+
+    ws.on("error", () => {
+      socketClosed = true;
+      failed = true;
+    });
+  },
+);
 
 function tailBytes(buf: Buffer, maxBytes: number): Buffer {
     if (buf.length <= maxBytes) return buf;

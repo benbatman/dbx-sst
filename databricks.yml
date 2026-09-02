@@ -37,7 +37,7 @@ variables:
       Model version created by the setup job. MUST be set to the actual
       registered version (read from the register job output) BEFORE deploying
       the `serving` / `app` target.
-    default: "2"
+    default: "3"
   workload_type:
     description: GPU model serving workload type
     default: CPU_MEDIUM
